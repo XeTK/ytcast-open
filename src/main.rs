@@ -168,6 +168,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     if oauth_creds.is_logged_in() {
         tracing::info!("[init] OAuth: logged in (token expires {})", oauth_creds.expiry_date);
+        // The first `n` decode parses the whole TV player (~2 min on a Cortex-A9): do it now, not on the first cast.
+        tokio::spawn(sabr::stream::prewarm_tv_nsig(http_client.clone()));
     } else {
         tracing::info!("[init] OAuth: not logged in (run with --login to authenticate)");
     }

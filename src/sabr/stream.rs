@@ -634,6 +634,29 @@ async fn tv_player(http: &reqwest::Client) -> Option<&'static (String, String, u
     }).await.as_ref()
 }
 
+/// Serialises TV `n` decodes. The first one parses the whole player (hundreds
+/// of MB, minutes on a small ARM core); a second parse running at the same
+/// time could exhaust memory, and would repeat the work the first one caches.
+static NSIG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Parse the TV player in the background so the first cast does not wait for it.
+/// The result is kept in memory and on disk (see `nsig`), so this is cheap on
+/// later starts and only costs time again when YouTube ships a new player.
+pub async fn prewarm_tv_nsig(http: reqwest::Client) {
+    let Some((js, hash, _)) = tv_player(&http).await else {
+        tracing::warn!("[tv] prewarm: could not fetch the TV player");
+        return;
+    };
+    let _guard = NSIG_LOCK.lock().await;
+    let (js, hash) = (js.clone(), hash.clone());
+    let started = std::time::Instant::now();
+    match tokio::task::spawn_blocking(move || decode_nsig(&js, "DI4nsWZGtpSkAiJab4d", &hash)).await {
+        Ok(Ok(_)) => tracing::info!("[tv] prewarm: player ready in {}s", started.elapsed().as_secs()),
+        Ok(Err(e)) => tracing::warn!("[tv] prewarm failed: {}", e),
+        Err(e) => tracing::warn!("[tv] prewarm task panicked: {}", e),
+    }
+}
+
 async fn get_player_data(
     http: &reqwest::Client,
     video_id: &str,
@@ -1426,6 +1449,7 @@ pub async fn stream_audio(
     if client_config.client_name == "TVHTML5" {
         if let (Some(n_val), Some((js, hash, _))) = (extract_n_param(&server_url), tv_player(client).await) {
             let (js, hash, n) = (js.clone(), hash.clone(), n_val.clone());
+            let _guard = NSIG_LOCK.lock().await;
             let decoded = tokio::task::spawn_blocking(move || decode_nsig(&js, &n, &hash))
                 .await
                 .map_err(|e| -> SabrError { format!("nsig task panicked: {}", e).into() })??;
