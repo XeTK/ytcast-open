@@ -25,6 +25,8 @@ use super::ump::{self, UmpParser};
 /// Metadata about the audio stream being served.
 pub struct SabrStreamInfo {
     pub title: String,
+    pub artist: String,
+    pub thumbnail_url: Option<String>,
     pub duration_secs: u64,
     pub mime_type: String,
 }
@@ -225,6 +227,8 @@ struct PlayerData {
     ustreamer_config: Vec<u8>,
     formats: Vec<AdaptiveFormat>,
     title: String,
+    artist: String,
+    thumbnail_url: Option<String>,
     duration_secs: u64,
 }
 
@@ -561,11 +565,16 @@ async fn innertube_player(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
 
+    let artist = clean_artist(json["videoDetails"]["author"].as_str().unwrap_or(""));
+    let thumbnail_url = pick_thumbnail(&json["videoDetails"]["thumbnail"]["thumbnails"], video_id);
+
     Ok(PlayerData {
         server_abr_streaming_url: server_abr_url,
         ustreamer_config,
         formats,
         title,
+        artist,
+        thumbnail_url,
         duration_secs,
     })
 }
@@ -587,6 +596,33 @@ struct PlayerResult {
 /// nsig decoding after this function returns.
 ///
 /// Fallback: IOS (no nsig needed, but 60s throttle without valid PoToken).
+/// "Artist - Topic" is how YouTube names auto-generated music channels; show just the artist.
+fn clean_artist(author: &str) -> String {
+    author.strip_suffix(" - Topic").unwrap_or(author).trim().to_owned()
+}
+
+/// Choose the cover image from `videoDetails.thumbnail.thumbnails`: the smallest one at least 400 px wide
+/// (enough for the unit's screen, small to fetch), else the largest. Falls back to the video's standard
+/// thumbnail. WebP variants are mapped to their JPEG twin, which the unit's decoder can read.
+fn pick_thumbnail(thumbnails: &serde_json::Value, video_id: &str) -> Option<String> {
+    let mut best: Option<(u64, &str)> = None;
+    for t in thumbnails.as_array().into_iter().flatten() {
+        let (Some(url), w) = (t["url"].as_str(), t["width"].as_u64().unwrap_or(0)) else { continue };
+        best = match best {
+            None => Some((w, url)),
+            Some((bw, _)) if bw < 400 && w > bw => Some((w, url)),
+            Some((bw, _)) if bw >= 400 && w >= 400 && w < bw => Some((w, url)),
+            keep => keep,
+        };
+    }
+    let url = match best {
+        Some((_, u)) => u.to_owned(),
+        None if video_id.len() == 11 => format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", video_id),
+        None => return None,
+    };
+    Some(url.replace("/vi_webp/", "/vi/").replace("/default.webp", "/default.jpg").replace("/hqdefault.webp", "/hqdefault.jpg"))
+}
+
 /// Extract the player hash from the `iframe_api` script, where it appears as
 /// `...\/s\/player\/<hash>\/...` (JSON-escaped slashes).
 fn parse_player_hash(iframe_api: &str) -> Option<String> {
@@ -1392,6 +1428,8 @@ pub async fn stream_audio(
 
     let info = SabrStreamInfo {
         title: player.title.clone(),
+        artist: player.artist.clone(),
+        thumbnail_url: player.thumbnail_url.clone(),
         duration_secs: player.duration_secs,
         mime_type: audio_fmt.mime_type.clone(),
     };
@@ -1617,6 +1655,41 @@ mod tests {
     fn signature_timestamp_rejects_wrong_length() {
         assert_eq!(parse_signature_timestamp("signatureTimestamp:1234,"), None);
         assert_eq!(parse_signature_timestamp("nothing"), None);
+    }
+
+    #[test]
+    fn artist_topic_suffix_removed() {
+        assert_eq!(clean_artist("Noisia - Topic"), "Noisia");
+        assert_eq!(clean_artist("  Noisia "), "Noisia");
+        assert_eq!(clean_artist(""), "");
+    }
+
+    #[test]
+    fn thumbnail_prefers_smallest_big_enough() {
+        let t = serde_json::json!([
+            {"url": "https://x/60", "width": 60}, {"url": "https://x/226", "width": 226},
+            {"url": "https://x/544", "width": 544}, {"url": "https://x/1200", "width": 1200}]);
+        assert_eq!(pick_thumbnail(&t, "abcdefghijk").as_deref(), Some("https://x/544"));
+        // Order does not matter.
+        let t = serde_json::json!([{"url": "https://x/1200", "width": 1200}, {"url": "https://x/544", "width": 544}]);
+        assert_eq!(pick_thumbnail(&t, "abcdefghijk").as_deref(), Some("https://x/544"));
+    }
+
+    #[test]
+    fn thumbnail_falls_back_to_largest_then_standard() {
+        let t = serde_json::json!([{"url": "https://x/60", "width": 60}, {"url": "https://x/226", "width": 226}]);
+        assert_eq!(pick_thumbnail(&t, "abcdefghijk").as_deref(), Some("https://x/226"));
+        assert_eq!(
+            pick_thumbnail(&serde_json::Value::Null, "abcdefghijk").as_deref(),
+            Some("https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg")
+        );
+        assert_eq!(pick_thumbnail(&serde_json::Value::Null, "short"), None);
+    }
+
+    #[test]
+    fn thumbnail_webp_mapped_to_jpeg() {
+        let t = serde_json::json!([{"url": "https://i.ytimg.com/vi_webp/abc/hqdefault.webp", "width": 480}]);
+        assert_eq!(pick_thumbnail(&t, "abcdefghijk").as_deref(), Some("https://i.ytimg.com/vi/abc/hqdefault.jpg"));
     }
 
     #[test]

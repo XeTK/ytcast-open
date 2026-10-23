@@ -18,6 +18,47 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 // Shared state
 // ---------------------------------------------------------------------------
 
+/// What is playing, for a display on the same device (`GET /now`, `GET /cover`).
+#[derive(Default)]
+pub struct NowPlaying {
+    pub video_id: String,
+    pub title: String,
+    pub artist: String,
+    pub duration_secs: u64,
+    /// Cover image bytes (JPEG), once fetched.
+    pub cover: Option<Vec<u8>>,
+}
+
+/// The `/now` JSON; `cover` tells a display whether `/cover` has an image yet.
+fn now_json(n: &NowPlaying) -> serde_json::Value {
+    serde_json::json!({
+        "id": n.video_id,
+        "title": n.title,
+        "artist": n.artist,
+        "duration": n.duration_secs,
+        "cover": n.cover.is_some(),
+    })
+}
+
+/// Fetch a cover image (JPEG, at most 2 MB) and keep it if `video_id` is still the current track.
+async fn fetch_cover(state: Arc<DialState>, video_id: String, url: String) {
+    let resp = match state.http_client.get(&url).timeout(std::time::Duration::from_secs(15)).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => { tracing::warn!("[now] cover {} -> HTTP {}", url, r.status()); return; }
+        Err(e) => { tracing::warn!("[now] cover fetch failed: {}", e); return; }
+    };
+    let bytes = match resp.bytes().await {
+        Ok(b) if b.len() <= 2 * 1024 * 1024 => b.to_vec(),
+        Ok(b) => { tracing::warn!("[now] cover too big ({} bytes)", b.len()); return; }
+        Err(e) => { tracing::warn!("[now] cover read failed: {}", e); return; }
+    };
+    let mut now = state.now.write().unwrap();
+    if now.video_id == video_id {
+        tracing::info!("[now] cover for {}: {} bytes", video_id, bytes.len());
+        now.cover = Some(bytes);
+    }
+}
+
 pub struct DialState {
     /// Whether the "YouTube" DIAL app is currently running.
     pub running: AtomicBool,
@@ -47,6 +88,8 @@ pub struct DialState {
     pub oauth_state: Option<std::sync::Arc<crate::oauth::OAuthState>>,
     /// Screen ID for the "cl" (YouTube) Lounge session, exposed in DIAL additionalData.
     pub screen_id: String,
+    /// The track being played, for `/now` and `/cover`.
+    pub now: std::sync::RwLock<NowPlaying>,
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +116,10 @@ pub async fn run_dial_server(
         .route("/debug/resume", get(debug_resume))
         .route("/debug/seek/{seconds}", get(debug_seek))
         .route("/debug/stop", get(debug_stop))
+        .route("/debug/next", get(debug_next))
+        .route("/debug/prev", get(debug_prev))
+        .route("/now", get(now_playing))
+        .route("/cover", get(now_cover))
         .with_state(state);
 
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
@@ -351,6 +398,19 @@ async fn stream_audio(
     let oauth = state.oauth_state.clone();
     match crate::sabr::stream::stream_audio(&state.http_client, &video_id, ctt.as_deref(), yt_cookies, yt_session, oauth.as_ref()).await {
         Ok((info, rx)) => {
+            {
+                let mut now = state.now.write().unwrap();
+                *now = NowPlaying {
+                    video_id: video_id.clone(),
+                    title: info.title.clone(),
+                    artist: info.artist.clone(),
+                    duration_secs: info.duration_secs,
+                    cover: None,
+                };
+            }
+            if let Some(url) = info.thumbnail_url.clone() {
+                tokio::spawn(fetch_cover(state.clone(), video_id.clone(), url));
+            }
             // Build streaming response from the mpsc receiver.
             // When YTCAST_DUMP_STREAM=1, also write every byte to /tmp/sabr-dump-{id}.webm
             // so we can inspect with ffprobe if MPD crashes.
@@ -412,5 +472,62 @@ async fn stream_audio(
             )
                 .into_response()
         }
+    }
+}
+
+async fn debug_next(State(state): State<Arc<DialState>>) -> Response {
+    let Some(tx) = &state.player_cmd_tx else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no player channel").into_response();
+    };
+    tracing::info!("[debug] next");
+    let _ = tx.send(crate::lounge::PlayerCommand::Next).await;
+    (StatusCode::OK, "next").into_response()
+}
+
+async fn debug_prev(State(state): State<Arc<DialState>>) -> Response {
+    let Some(tx) = &state.player_cmd_tx else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no player channel").into_response();
+    };
+    tracing::info!("[debug] prev");
+    let _ = tx.send(crate::lounge::PlayerCommand::Previous).await;
+    (StatusCode::OK, "previous").into_response()
+}
+
+/// `GET /now`: JSON for a display on this device.
+async fn now_playing(State(state): State<Arc<DialState>>) -> Response {
+    let json = now_json(&state.now.read().unwrap());
+    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json.to_string()).into_response()
+}
+
+/// `GET /cover`: the current track's cover image, or 404 until it has been fetched.
+async fn now_cover(State(state): State<Arc<DialState>>) -> Response {
+    match state.now.read().unwrap().cover.clone() {
+        Some(bytes) => (StatusCode::OK, [(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response(),
+        None => (StatusCode::NOT_FOUND, "no cover").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn now_json_reports_cover_availability() {
+        let mut n = NowPlaying { video_id: "abc".into(), title: "T".into(), artist: "A".into(), duration_secs: 259, cover: None };
+        let j = now_json(&n);
+        assert_eq!(j["title"], "T");
+        assert_eq!(j["artist"], "A");
+        assert_eq!(j["duration"], 259);
+        assert_eq!(j["cover"], false);
+        n.cover = Some(vec![0xff, 0xd8]);
+        assert_eq!(now_json(&n)["cover"], true);
+    }
+
+    #[test]
+    fn now_json_escapes_quotes_and_unicode() {
+        let n = NowPlaying { title: "He said \"hi\" \u{e9}".into(), ..Default::default() };
+        let text = now_json(&n).to_string();
+        let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back["title"], "He said \"hi\" \u{e9}");
     }
 }

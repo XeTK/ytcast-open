@@ -267,6 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         yt_session: yt_session.clone(),
         oauth_state: if oauth_creds.is_logged_in() { Some(oauth_state.clone()) } else { None },
         screen_id: config.screen_id.clone(),
+        now: Default::default(),
     });
 
     // 12. Spawn background tasks
