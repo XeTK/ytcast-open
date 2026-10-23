@@ -60,6 +60,22 @@ const IOS_CLIENT: InnerTubeClient = InnerTubeClient {
     android_sdk_version: None,
 };
 
+/// YouTube TV (Cobalt/Leanback) client. Accepts the cast session's `ctt` and an
+/// OAuth Bearer token; both give Premium/identity-backed streams that are not
+/// subject to the 60s stream-protection throttle that unauthenticated IOS gets.
+/// Version tracks what youtube.com/tv currently serves.
+const TVHTML5_CLIENT: InnerTubeClient = InnerTubeClient {
+    client_name: "TVHTML5",
+    client_version: "7.20261021.13.00",
+    device_make: "",
+    device_model: "",
+    os_name: "",
+    os_version: "",
+    user_agent: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+    client_name_id: 7,
+    android_sdk_version: None,
+};
+
 const ANDROID_CLIENT: InnerTubeClient = InnerTubeClient {
     client_name: "ANDROID",
     client_version: "19.44.38",
@@ -241,6 +257,10 @@ fn build_minimal_context(
         "utcOffsetMinutes": 0,
     });
 
+    if itclient.client_name == "TVHTML5" {
+        client_obj["clientScreen"] = serde_json::json!("WATCH");
+    }
+
     if let Some(vd) = visitor_data {
         if !vd.is_empty() {
             client_obj["visitorData"] = serde_json::json!(vd);
@@ -282,6 +302,7 @@ async fn innertube_player(
     yt_cookies: Option<&crate::cookies::YtCookies>,
     yt_session: Option<&crate::cookies::YtMusicSession>,
     oauth_token: Option<&str>,
+    sts_override: Option<u64>,
 ) -> Result<PlayerData, SabrError> {
     let is_web_remix = itclient.client_name == "WEB_REMIX";
 
@@ -313,6 +334,8 @@ async fn innertube_player(
         // Non-WEB_REMIX (IOS, ANDROID, WEB): always use minimal context
         (build_minimal_context(itclient, ctt, visitor_data), None)
     };
+
+    let sig_timestamp = sig_timestamp.or(sts_override);
 
     // --- Build playbackContext ---
     let mut playback_ctx = serde_json::json!({
@@ -552,6 +575,9 @@ struct PlayerResult {
     player: PlayerData,
     gvs_token: Option<GvsToken>,
     client_config: &'static InnerTubeClient,
+    /// True when the OAuth Bearer (not the cast `ctt`) authenticated /player;
+    /// the SABR CDN requests must then carry the same Bearer.
+    bearer: bool,
 }
 
 /// Call InnerTube /player using WEB_REMIX + ctt + cookies.
@@ -561,14 +587,83 @@ struct PlayerResult {
 /// nsig decoding after this function returns.
 ///
 /// Fallback: IOS (no nsig needed, but 60s throttle without valid PoToken).
+/// Extract the player hash from the `iframe_api` script, where it appears as
+/// `...\/s\/player\/<hash>\/...` (JSON-escaped slashes).
+fn parse_player_hash(iframe_api: &str) -> Option<String> {
+    let idx = iframe_api.find("player\\/")?;
+    let hash: String = iframe_api[idx + "player\\/".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    (hash.len() >= 6).then_some(hash)
+}
+
+/// Find the 5-digit `signatureTimestamp:NNNNN` constant in a player JS file.
+fn parse_signature_timestamp(js: &str) -> Option<u64> {
+    for part in js.split("signatureTimestamp") {
+        if let Some(rest) = part.trim_start().strip_prefix(':') {
+            let num: String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+            if num.len() == 5 {
+                return num.parse().ok();
+            }
+        }
+    }
+    None
+}
+
+/// Value of the `n` query parameter of a SABR URL, if present.
+fn extract_n_param(url: &str) -> Option<String> {
+    let query = &url[url.find('?')? + 1..];
+    query.split('&').find_map(|pair| pair.strip_prefix("n=").map(str::to_owned))
+}
+
+/// TV player JS `(js, hash, signatureTimestamp)` for nsig decoding, fetched once.
+static TV_PLAYER: tokio::sync::OnceCell<Option<(String, String, u64)>> = tokio::sync::OnceCell::const_new();
+
+async fn tv_player(http: &reqwest::Client) -> Option<&'static (String, String, u64)> {
+    TV_PLAYER.get_or_init(|| async {
+        let ua = TVHTML5_CLIENT.user_agent;
+        let api = http.get("https://www.youtube.com/iframe_api").header("User-Agent", ua)
+            .send().await.ok()?.text().await.ok()?;
+        let hash = parse_player_hash(&api)?;
+        let url = format!("https://www.youtube.com/s/player/{}/tv-player-ias.vflset/tv-player-ias.js", hash);
+        let js = http.get(&url).header("User-Agent", ua).send().await.ok()?.text().await.ok()?;
+        let sts = parse_signature_timestamp(&js)?;
+        tracing::info!("[tv] player hash={} js={}B sts={}", hash, js.len(), sts);
+        Some((js, hash, sts))
+    }).await.as_ref()
+}
+
 async fn get_player_data(
     http: &reqwest::Client,
     video_id: &str,
     ctt: Option<&str>,
     yt_cookies: Option<&crate::cookies::YtCookies>,
     yt_session: Option<&crate::cookies::YtMusicSession>,
-    _oauth_token: Option<&str>,
+    oauth_token: Option<&str>,
 ) -> Result<PlayerResult, SabrError> {
+    // --- TVHTML5: the cast session's ctt (viewer identity) first, then the OAuth Bearer ---
+    if ctt.is_some() || oauth_token.is_some() {
+        let sts = tv_player(http).await.map(|t| t.2);
+        let visitor_data = generate_visitor_data();
+        let attempts = [(ctt, None, false), (None, oauth_token, true)];
+        for (ctt, bearer_token, is_bearer) in attempts {
+            if ctt.is_none() && bearer_token.is_none() {
+                continue;
+            }
+            match innertube_player(
+                http, video_id, &TVHTML5_CLIENT, ctt, Some(&visitor_data), None,
+                None, None, bearer_token, sts,
+            ).await {
+                Ok(data) => {
+                    tracing::info!("[sabr] TVHTML5 /player OK ({})", if is_bearer { "oauth" } else { "ctt" });
+                    return Ok(PlayerResult { player: data, gvs_token: None, client_config: &TVHTML5_CLIENT, bearer: is_bearer });
+                }
+                Err(e) => tracing::warn!("[sabr] TVHTML5 /player failed: {}", e),
+            }
+        }
+    }
+
     let gvs = fetch_pot_token(http, Some(video_id)).await;
 
     // --- Attempt 1: WEB_REMIX + ctt + cookies ---
@@ -578,11 +673,11 @@ async fn get_player_data(
             ctt.is_some(), yt_cookies.is_some());
         match innertube_player(
             http, video_id, &WEB_REMIX_CLIENT, ctt, None, None,
-            yt_cookies, yt_session, None,
+            yt_cookies, yt_session, None, None,
         ).await {
             Ok(data) => {
                 tracing::info!("[sabr] WEB_REMIX /player OK");
-                return Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &WEB_REMIX_CLIENT });
+                return Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &WEB_REMIX_CLIENT, bearer: false });
             }
             Err(e) => {
                 tracing::warn!("[sabr] WEB_REMIX /player failed: {}", e);
@@ -593,9 +688,9 @@ async fn get_player_data(
     // --- Fallback: IOS ---
     // No nsig needed but 60s throttle (stream_protection_status=2).
     tracing::info!("[sabr] IOS /player fallback (potoken={})", gvs.is_some());
-    let data = innertube_player(http, video_id, &IOS_CLIENT, None, None, None, None, None, None).await?;
+    let data = innertube_player(http, video_id, &IOS_CLIENT, None, None, None, None, None, None, None).await?;
     tracing::info!("[sabr] IOS /player OK");
-    Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &IOS_CLIENT })
+    Ok(PlayerResult { player: data, gvs_token: gvs, client_config: &IOS_CLIENT, bearer: false })
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +800,8 @@ struct SabrState {
     client_config: &'static InnerTubeClient,
     po_token: Option<Vec<u8>>,
     cookie_header: Option<String>,
+    /// OAuth Bearer for CDN requests (TVHTML5 only).
+    bearer: Option<String>,
     done: bool,
 }
 
@@ -749,6 +846,7 @@ impl SabrState {
             client_config,
             po_token: None,
             cookie_header: None,
+            bearer: None,
             done: false,
         }
     }
@@ -761,12 +859,12 @@ impl SabrState {
     /// - Always includes both in preferredAudio/VideoFormatIds
     fn build_request(&self) -> vs::VideoPlaybackAbrRequest {
         let client_info = vs::streamer_context::ClientInfo {
-            device_make: Some(self.client_config.device_make.to_owned()),
-            device_model: Some(self.client_config.device_model.to_owned()),
+            device_make: Some(self.client_config.device_make.to_owned()).filter(|v| !v.is_empty()),
+            device_model: Some(self.client_config.device_model.to_owned()).filter(|v| !v.is_empty()),
             client_name: Some(self.client_config.client_name_id),
             client_version: Some(self.client_config.client_version.to_owned()),
-            os_name: Some(self.client_config.os_name.to_owned()),
-            os_version: Some(self.client_config.os_version.to_owned()),
+            os_name: Some(self.client_config.os_name.to_owned()).filter(|v| !v.is_empty()),
+            os_version: Some(self.client_config.os_version.to_owned()).filter(|v| !v.is_empty()),
             android_sdk_version: self.client_config.android_sdk_version,
             ..Default::default()
         };
@@ -1111,6 +1209,9 @@ async fn sabr_request_cycle(
     if let Some(ref cookies) = state.cookie_header {
         req = req.header("Cookie", cookies);
     }
+    if let Some(ref token) = state.bearer {
+        req = req.header("Authorization", format!("Bearer {}", token));
+    }
 
     let resp = req.body(encoded).send().await?;
 
@@ -1240,6 +1341,7 @@ pub async fn stream_audio(
 
     // 1. Call InnerTube /player to get streaming metadata (+ GVS PoToken if bgutil-pot is running).
     let result = get_player_data(client, video_id, ctt, yt_cookies, yt_session, oauth_token.as_deref()).await?;
+    let used_bearer = result.bearer;
     let player = result.player;
     let client_config = result.client_config;
     // get_player_data already handled PoToken selection per attempt:
@@ -1321,16 +1423,28 @@ pub async fn stream_audio(
         }
     }
 
+    if client_config.client_name == "TVHTML5" {
+        if let (Some(n_val), Some((js, hash, _))) = (extract_n_param(&server_url), tv_player(client).await) {
+            let (js, hash, n) = (js.clone(), hash.clone(), n_val.clone());
+            let decoded = tokio::task::spawn_blocking(move || decode_nsig(&js, &n, &hash))
+                .await
+                .map_err(|e| -> SabrError { format!("nsig task panicked: {}", e).into() })??;
+            tracing::info!("[sabr] TV nsig decoded: {} -> {}", n_val, &decoded[..decoded.len().min(10)]);
+            server_url = replace_n_param(&server_url, &decoded);
+        }
+    }
+
     // 5. Spawn the SABR streaming loop.
     let http = client.clone();
     let ustreamer_config = player.ustreamer_config;
 
     let video_fmt_clone = video_fmt.clone();
     let cookie_header = yt_cookies.map(|c| c.cookie_header.clone());
+    let bearer = if used_bearer { oauth_token.clone() } else { None };
     tokio::spawn(async move {
         let result = sabr_loop(
             &http, server_url, &audio_fmt, &video_fmt_clone,
-            ustreamer_config, client_config, gvs_po_token, cookie_header, &tx,
+            ustreamer_config, client_config, gvs_po_token, cookie_header, bearer, &tx,
         ).await;
 
         match result {
@@ -1357,12 +1471,14 @@ async fn sabr_loop(
     client_config: &'static InnerTubeClient,
     po_token: Option<String>,
     cookie_header: Option<String>,
+    bearer: Option<String>,
     tx: &mpsc::Sender<Bytes>,
 ) -> Result<(), SabrError> {
     let mut state = SabrState::new(
         server_url, audio_format, video_format, ustreamer_config, client_config,
     );
     state.cookie_header = cookie_header;
+    state.bearer = bearer;
 
     // Set PoToken for SABR StreamerContext (decoded from base64 to bytes).
     // bgutil-pot returns URL-safe base64 (uses `-` and `_`) with optional padding.
@@ -1447,4 +1563,117 @@ async fn sabr_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn player_hash_from_iframe_api() {
+        let api = r#"var scriptUrl = 'https:\/\/www.youtube.com\/s\/player\/cbcfbf2f\/www-widgetapi.vflset\/www-widgetapi.js';"#;
+        assert_eq!(parse_player_hash(api).as_deref(), Some("cbcfbf2f"));
+    }
+
+    #[test]
+    fn player_hash_rejects_missing_or_short() {
+        assert_eq!(parse_player_hash("no player path here"), None);
+        assert_eq!(parse_player_hash(r"x\/s\/player\/ab\/y"), None);
+    }
+
+    #[test]
+    fn signature_timestamp_parsed() {
+        assert_eq!(parse_signature_timestamp("a,signatureTimestamp:20746,b"), Some(20746));
+        assert_eq!(parse_signature_timestamp("signatureTimestamp : 20746;"), Some(20746));
+        // The first match may be unrelated; a later one still counts.
+        assert_eq!(parse_signature_timestamp("signatureTimestamp:x;signatureTimestamp:20746"), Some(20746));
+    }
+
+    #[test]
+    fn signature_timestamp_rejects_wrong_length() {
+        assert_eq!(parse_signature_timestamp("signatureTimestamp:1234,"), None);
+        assert_eq!(parse_signature_timestamp("nothing"), None);
+    }
+
+    #[test]
+    fn n_param_extracted_and_replaced() {
+        let url = "https://rr1.googlevideo.com/videoplayback?expire=1&n=abc123&sig=zz";
+        assert_eq!(extract_n_param(url).as_deref(), Some("abc123"));
+        assert_eq!(
+            replace_n_param(url, "XYZ"),
+            "https://rr1.googlevideo.com/videoplayback?expire=1&n=XYZ&sig=zz"
+        );
+        // `n` as the first parameter, and as the last.
+        assert_eq!(extract_n_param("https://h/p?n=a&x=1").as_deref(), Some("a"));
+        assert_eq!(replace_n_param("https://h/p?x=1&n=a", "B"), "https://h/p?x=1&n=B");
+    }
+
+    #[test]
+    fn n_param_absent() {
+        assert_eq!(extract_n_param("https://h/p?expire=1&sig=zz"), None);
+        assert_eq!(extract_n_param("https://h/p"), None);
+        // A parameter merely ending in `n` must not match.
+        assert_eq!(extract_n_param("https://h/p?min=1"), None);
+        assert_eq!(replace_n_param("https://h/p?x=1", "B"), "https://h/p?x=1");
+    }
+
+    #[test]
+    fn tv_context_has_client_screen_and_ctt() {
+        let ctx = build_minimal_context(&TVHTML5_CLIENT, Some("tok123"), Some("vd"));
+        assert_eq!(ctx["client"]["clientName"], "TVHTML5");
+        assert_eq!(ctx["client"]["clientVersion"], TVHTML5_CLIENT.client_version);
+        assert_eq!(ctx["client"]["clientScreen"], "WATCH");
+        assert_eq!(ctx["client"]["visitorData"], "vd");
+        assert_eq!(ctx["user"]["credentialTransferTokens"][0]["token"], "tok123");
+        assert_eq!(ctx["user"]["credentialTransferTokens"][0]["scope"], "VIDEO");
+        // The TV client has no device fields; none should be sent.
+        assert!(ctx["client"].get("deviceMake").is_none());
+    }
+
+    #[test]
+    fn non_tv_context_unchanged() {
+        let ctx = build_minimal_context(&IOS_CLIENT, None, None);
+        assert!(ctx["client"].get("clientScreen").is_none());
+        assert_eq!(ctx["client"]["deviceMake"], "Apple");
+        assert!(ctx.get("user").is_none());
+    }
+
+    fn fmt(itag: i32) -> AdaptiveFormat {
+        AdaptiveFormat { itag, last_modified: 1, xtags: None, mime_type: "audio/webm".into(), bitrate: 1 }
+    }
+
+    #[test]
+    fn sabr_client_info_omits_empty_device_fields_for_tv() {
+        let state = SabrState::new("https://h/p".into(), &fmt(251), &fmt(160), vec![], &TVHTML5_CLIENT);
+        let info = state.build_request().streamer_context.unwrap().client_info.unwrap();
+        assert_eq!(info.client_name, Some(7));
+        assert_eq!(info.device_make, None);
+        assert_eq!(info.os_name, None);
+    }
+
+    #[test]
+    fn sabr_client_info_keeps_device_fields_for_ios() {
+        let state = SabrState::new("https://h/p".into(), &fmt(251), &fmt(160), vec![], &IOS_CLIENT);
+        let info = state.build_request().streamer_context.unwrap().client_info.unwrap();
+        assert_eq!(info.device_make.as_deref(), Some("Apple"));
+        assert_eq!(info.client_name, Some(5));
+    }
+
+    /// Canary: the bundled solver must still handle the player YouTube serves
+    /// to TVs right now. Needs network and ~40s; run with
+    /// `cargo test -- --ignored tv_player_nsig_solver_canary`.
+    #[tokio::test]
+    #[ignore]
+    async fn tv_player_nsig_solver_canary() {
+        let http = reqwest::Client::new();
+        let (js, hash, sts) = tv_player(&http).await.expect("TV player fetch/parse");
+        assert!(*sts > 10_000, "implausible signatureTimestamp {}", sts);
+        let n = "DI4nsWZGtpSkAiJab4d";
+        let (js, hash) = (js.clone(), hash.clone());
+        let decoded = tokio::task::spawn_blocking(move || decode_nsig(&js, n, &hash))
+            .await
+            .unwrap()
+            .expect("solver should decode n against the live TV player");
+        assert!(!decoded.is_empty() && decoded != n);
+    }
 }
